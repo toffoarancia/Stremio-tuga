@@ -127,8 +127,10 @@ async function extractStreamsForEpisode(pid, sec) {
     if (uf && pf) {
       await uf.type(process.env.WP_USER || '', { delay: 20 });
       await pf.type(process.env.WP_PASS || '', { delay: 20 });
-      const btn = await page.$('button[name="login"]') || await page.$('button[type="submit"]');
-      if (btn) await Promise.all([btn.click(), page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {})]);
+      await Promise.all([
+        page.evaluate(() => { const b = document.querySelector('button[name="login"]') || document.querySelector('button[type="submit"]'); if (b) b.click(); }),
+        page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {}),
+      ]);
     }
 
     // Call admin-ajax.php with the episode action
@@ -167,7 +169,7 @@ async function extractStreamsForEpisode(pid, sec) {
         const data = JSON.parse(embedHtml.text);
         let embedUrl = null;
         if (data.embed_url) {
-          const m = data.embed_url.match(/(?:src|SRC)=["']([^"']+)["']/i);
+          const m = data.embed_url.match(/(?:src|SRC)=["']([^"'<>\s]+)/i);
           if (m) embedUrl = m[1];
         }
         if (!embedUrl && data.play_url) embedUrl = data.play_url;
@@ -204,10 +206,7 @@ async function extractStreamsForEpisode(pid, sec) {
 }
 
 async function extractStreams(pageUrl) {
-  // The zetaplayer API requires a logged-in WordPress session.
-  // Strategy: use Puppeteer to log in, then navigate to the page,
-  // click the player tab, and intercept the iframe src that loads.
-
+  // Login, get nonce from page, call zetaplayer API directly, then get .m3u8 from embed
   const streams = [];
   const seen = new Set();
   function addStream(s) {
@@ -215,172 +214,86 @@ async function extractStreams(pageUrl) {
     if (key && !seen.has(key)) { seen.add(key); streams.push(s); }
   }
 
-  const SKIP_HOSTS = ['recaptcha', 'google.com', 'youtube.com', 'youtu.be',
-    'facebook.com', 'disqus.com', 'variationconfused', 'googlesyndication',
-    'doubleclick', 'amazon-adsystem', 'osteusfilmestuga.online'];
-  function isPlayerEmbed(src) {
-    if (!src || !src.startsWith('http')) return false;
-    try { return !SKIP_HOSTS.some(s => src.includes(s)); } catch { return false; }
-  }
-
   const br = await getBrowser();
   const page = await br.newPage();
-
   try {
     await page.setRequestInterception(true);
-
-    // Capture all responses — we want the zetaplayer API call after login
-    let playerEmbedUrl = null;
-    const apiResponses = [];
-
-    page.on('response', async resp => {
-      const u = resp.url();
-      if (u.includes('zetaplayer') || (u.includes('admin-ajax') && !u.includes('counting'))) {
-        try {
-          const text = await resp.text().catch(() => '');
-          console.log('[streams] intercepted: ' + u + ' -> ' + text.slice(0, 200));
-          apiResponses.push({ url: u, body: text });
-          // Parse embed URL from response
-          try {
-            const data = JSON.parse(text);
-            if (data.embed_url) {
-              // embed_url is an HTML string like <IFRAME SRC="https://...">
-              const srcMatch = data.embed_url.match(/(?:src|SRC)=[\"']+([^\"']+)[\"']/i);
-              if (srcMatch) playerEmbedUrl = srcMatch[1];
-            }
-            if (!playerEmbedUrl && data.play_url && data.play_url.startsWith('http')) {
-              playerEmbedUrl = data.play_url;
-            }
-          } catch {}
-        } catch {}
-      }
-      // Direct video
-      if (resp.url().match(/\.(mp4|m3u8)(\?|$)/i)) {
-        addStream({ title: '▶ Direto PT', url: resp.url() });
-      }
-    });
-
     page.on('request', req => {
-      const u = req.url();
-      const rt = req.resourceType();
-      // Block ads and binary media only — allow ALL scripts so zetaplayer works
-      if (['image', 'font', 'media'].includes(rt)) return req.abort();
-      if (['googlesyndication','doubleclick','amazon-adsystem','taboola','outbrain','variationconfused','hotjar','clarity.ms'].some(h => u.includes(h))) return req.abort();
+      const u = req.url(), rt = req.resourceType();
+      if (['image','font','media'].includes(rt)) return req.abort();
+      if (['googlesyndication','doubleclick','amazon-adsystem'].some(h => u.includes(h))) return req.abort();
       req.continue();
     });
-
+    // Capture direct video URLs
+    page.on('response', resp => {
+      if (resp.url().match(/\.(?:mp4|m3u8)(\?|$)/i)) addStream({ title: '▶ Direto PT', url: resp.url() });
+    });
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36');
 
-    // Step 1: Log in via WooCommerce My Account page
-    console.log('[streams] logging in...');
+    // Login
     await page.goto('https://osteusfilmestuga.online/a-minha-conta/', { waitUntil: 'domcontentloaded', timeout: 20000 });
-
-    // WooCommerce login fields: #username and #password
-    // Try multiple possible selectors
-    // Try all possible login field selectors
-    const userField = await page.$('#username')
-      || await page.$('input[name="username"]')
-      || await page.$('input[name="email"]')
-      || await page.$('input[type="email"]')
-      || await page.$('#user_login')
-      || await page.$('input[autocomplete="username"]')
-      || await page.$('input[autocomplete="email"]');
-    const passField = await page.$('#password')
-      || await page.$('input[name="password"]')
-      || await page.$('#user_pass')
-      || await page.$('input[type="password"]')
-      || await page.$('input[autocomplete="current-password"]');
-
-    console.log('[streams] userField=' + (userField ? 'found' : 'NOT FOUND'));
-    console.log('[streams] passField=' + (passField ? 'found' : 'NOT FOUND'));
-
-    if (userField && passField) {
-      await userField.click({ clickCount: 3 });
-      await userField.type(process.env.WP_USER || 'toffoarancia@googlemail.com', { delay: 30 });
-      await passField.click({ clickCount: 3 });
-      await passField.type(process.env.WP_PASS || '60Toffo60!', { delay: 30 });
-
-      // Submit — try multiple button selectors
-      const submitBtn = await page.$('button[name="login"]') || await page.$('input[type="submit"]') || await page.$('button[type="submit"]') || await page.$('.woocommerce-form-login__submit');
-      if (submitBtn) {
-        await Promise.all([
-          submitBtn.click(),
-          page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {}),
-        ]);
-      }
+    const uf = await page.$('#username') || await page.$('input[name="username"]') || await page.$('input[type="email"]');
+    const pf = await page.$('#password') || await page.$('input[name="password"]') || await page.$('input[type="password"]');
+    if (uf && pf) {
+      await uf.type(process.env.WP_USER || '', { delay: 20 });
+      await pf.type(process.env.WP_PASS || '', { delay: 20 });
+      await Promise.all([
+        page.evaluate(() => { const b = document.querySelector('button[name="login"]') || document.querySelector('button[type="submit"]'); if (b) b.click(); }),
+        page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {}),
+      ]);
     }
-    const loggedInUrl = page.url();
-    console.log('[streams] after login, url=' + loggedInUrl);
+    console.log('[streams] logged in, url=' + page.url());
 
-    // Step 2: Navigate to content page
-    console.log('[streams] navigating to ' + pageUrl);
-    await page.goto(pageUrl, { waitUntil: 'networkidle2', timeout: 30000 });
-    await new Promise(r => setTimeout(r, 3000));
+    // Navigate to content page and get player options + nonce
+    await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await new Promise(r => setTimeout(r, 2000));
 
-    // Wait for player tabs to appear (episode pages load them via AJAX)
-    try {
-      await page.waitForSelector('li.zetaflix_player_option', { timeout: 8000 });
-    } catch(e) {
-      console.log('[streams] player tabs did not appear, trying anyway');
-    }
+    const pageInfo = await page.evaluate(() => {
+      const nonce = (document.body.innerHTML.match(/"nonce"\s*:\s*"([a-f0-9]+)"/) || [])[1] || '';
+      const tabs = Array.from(document.querySelectorAll('li.zetaflix_player_option')).map(li => ({
+        postId: li.getAttribute('data-post'),
+        type: li.getAttribute('data-type') || 'mv',
+        nume: li.getAttribute('data-nume'),
+      })).filter(t => t.postId && t.nume);
+      return { nonce, tabs };
+    });
+    console.log('[streams] tabs=' + pageInfo.tabs.length + ' nonce=' + pageInfo.nonce);
 
-    // Step 3: Click each player tab using JS and wait for zetaplayer API response
-    const tabCount = await page.evaluate(() =>
-      document.querySelectorAll('li.zetaflix_player_option').length
-    );
-    console.log('[streams] found ' + tabCount + ' player tabs');
+    // Call zetaplayer API for each tab using fetch with credentials
+    for (let i = 0; i < Math.min(pageInfo.tabs.length, 3); i++) {
+      const tab = pageInfo.tabs[i];
+      const apiUrl = '/wp-json/zetaplayer/v2/' + tab.postId + '/' + tab.type + '/' + tab.nume;
+      try {
+        const result = await page.evaluate(async (apiUrl, nonce) => {
+          const resp = await fetch(apiUrl, {
+            headers: { 'X-WP-Nonce': nonce, 'Accept': 'application/json' },
+            credentials: 'include',
+          });
+          return await resp.text();
+        }, apiUrl, pageInfo.nonce);
 
-    for (let i = 0; i < Math.min(tabCount, 3); i++) {
-      playerEmbedUrl = null;
+        const data = JSON.parse(result);
+        console.log('[streams] tab ' + (i+1) + ' embed_url=' + data.embed_url?.slice(0, 80));
 
-      // Use JS click — more reliable than Puppeteer .click() for custom event handlers
-      await page.evaluate((idx) => {
-        const tabs = document.querySelectorAll('li.zetaflix_player_option');
-        if (tabs[idx]) {
-          tabs[idx].dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-        }
-      }, i);
-
-      // Wait for zetaplayer API response (up to 6 seconds)
-      const start = Date.now();
-      while (!playerEmbedUrl && Date.now() - start < 6000) {
-        await new Promise(r => setTimeout(r, 500));
-      }
-      console.log('[streams] tab ' + (i+1) + ' playerEmbedUrl=' + playerEmbedUrl);
-
-      if (playerEmbedUrl && isPlayerEmbed(playerEmbedUrl)) {
-        const direct = await extractDirectVideo(playerEmbedUrl).catch(() => null);
-        if (direct) {
-          addStream({ title: '▶ Player ' + (i+1) + ' PT (direto)', url: direct });
-        } else {
-          try {
-            const host = new URL(playerEmbedUrl).hostname.replace('www.', '');
-            addStream({ title: '▶ Player ' + (i+1) + ' (' + host + ')', externalUrl: playerEmbedUrl, behaviorHints: { notWebReady: true } });
-          } catch {}
-        }
-        continue;
-      }
-
-      // Fallback: check iframe src in DOM
-      const iframes = await page.evaluate(() =>
-        Array.from(document.querySelectorAll('iframe')).map(f => ({ src: f.src, id: f.id, cls: f.className }))
-      );
-      console.log('[streams] tab ' + (i+1) + ' iframes: ' + JSON.stringify(iframes.map(f => f.src)));
-      for (const f of iframes) {
-        if (isPlayerEmbed(f.src) && !f.src.includes('osteusfilmestuga')) {
-          const direct = await extractDirectVideo(f.src).catch(() => null);
-          if (direct) {
-            addStream({ title: '▶ Player ' + (i+1) + ' PT (direto)', url: direct });
-          } else {
-            try {
-              const host = new URL(f.src).hostname.replace('www.', '');
-              addStream({ title: '▶ Player ' + (i+1) + ' (' + host + ')', externalUrl: f.src, behaviorHints: { notWebReady: true } });
-            } catch {}
+        if (data.embed_url) {
+          const m = data.embed_url.match(/(?:src|SRC)=["']([^"'<>\s]+)/i);
+          if (m && m[1].startsWith('http')) {
+            const embedUrl = m[1];
+            const direct = await extractDirectVideo(embedUrl).catch(() => null);
+            if (direct) {
+              addStream({ title: '▶ Player ' + (i+1) + ' PT (direto)', url: direct });
+            } else {
+              try {
+                const host = new URL(embedUrl).hostname.replace('www.', '');
+                addStream({ title: '▶ Player ' + (i+1) + ' (' + host + ')', externalUrl: embedUrl });
+              } catch {}
+            }
           }
         }
+      } catch(e) {
+        console.log('[streams] tab ' + (i+1) + ' error: ' + e.message);
       }
     }
-
   } catch(e) {
     console.error('[streams] error: ' + e.message);
   } finally {
@@ -578,6 +491,23 @@ function scrapeItems($, typeFilter) {
   return items;
 }
 
+async function discoverEpisodeSlug(seriesSlug) {
+  const guesses = [
+    seriesSlug,
+    seriesSlug.replace(/^(a|o|os|as|um|uma)-/, ''),
+  ];
+  for (const guess of guesses) {
+    try {
+      const html = await get(BASE + '/episodio/' + guess + '-temporada-1-episodio-1/');
+      if (html.length > 5000 && !html.includes('Page Not Found')) {
+        console.log('[discoverSlug] found: ' + guess);
+        return guess;
+      }
+    } catch(e) {}
+  }
+  return null;
+}
+
 async function scrapeSeriesDetail(slug) {
   // Fast path: plain fetch (works on Railway since site doesn't block it)
   // Falls back to logged-in Puppeteer if blocked
@@ -662,8 +592,10 @@ async function scrapeSeriesWithPuppeteer(slug) {
     if (uf && pf) {
       await uf.type(process.env.WP_USER || '', { delay: 20 });
       await pf.type(process.env.WP_PASS || '', { delay: 20 });
-      const btn = await page.$('button[name="login"]') || await page.$('button[type="submit"]');
-      if (btn) await Promise.all([btn.click(), page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {})]);
+      await Promise.all([
+        page.evaluate(() => { const b = document.querySelector('button[name="login"]') || document.querySelector('button[type="submit"]'); if (b) b.click(); }),
+        page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {}),
+      ]);
     }
     await page.goto(seriesUrl(slug), { waitUntil: 'domcontentloaded', timeout: 30000 });
     await new Promise(r => setTimeout(r, 2000));
@@ -868,7 +800,7 @@ builder.defineStreamHandler(async ({ type, id }) => {
         return { streams: await extractStreamsForEpisode(pid, sec) };
       } else {
         // No pid stored, fall back to page URL discovery
-        const epSlug = await discoverEpisodeSlugLoggedIn(m[1], null).catch(() => null) || m[1];
+        const epSlug = await discoverEpisodeSlug(m[1]).catch(() => null) || m[1];
         pageUrl = BASE + '/episodio/' + epSlug + '-temporada-' + m[2] + '-episodio-' + m[3] + '/';
         console.log('[stream] fallback episode URL: ' + pageUrl);
       }
@@ -925,8 +857,10 @@ app.get('/debug-meta', async (req, res) => {
     if (uf && pf) {
       await uf.type(process.env.WP_USER || '', { delay: 20 });
       await pf.type(process.env.WP_PASS || '', { delay: 20 });
-      const btn = await page.$('button[name="login"]') || await page.$('button[type="submit"]');
-      if (btn) await Promise.all([btn.click(), page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {})]);
+      await Promise.all([
+        page.evaluate(() => { const b = document.querySelector('button[name="login"]') || document.querySelector('button[type="submit"]'); if (b) b.click(); }),
+        page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {}),
+      ]);
     }
 
     // Navigate to series page
@@ -982,7 +916,18 @@ app.get('/debug-meta', async (req, res) => {
   }
 });
 
-app.get('/health', (_, res) => res.json({ ok: true, time: new Date().toISOString() }));
+app.get('/test-catalog', async (req, res) => {
+  try {
+    const html = await get(`${BASE}/filmes/`);
+    const $ = cheerio.load(html);
+    const items = scrapeItems($, 'filmes');
+    res.json({ htmlLength: html.length, itemCount: items.length, first: items[0] || null });
+  } catch(e) {
+    res.json({ error: e.message });
+  }
+});
+
+
 
 // Debug: test stream extraction for a URL
 app.get('/debug-stream', async (req, res) => {
@@ -1028,17 +973,18 @@ app.get('/debug-stream', async (req, res) => {
       || await page.$('input[autocomplete="current-password"]');
     debug.loginFieldsFound = { user: !!userField, pass: !!passField };
     if (userField && passField) {
-      await userField.click({ clickCount: 3 });
+      await page.evaluate((u, p) => {
+        if (u) { u.value = ''; u.focus(); }
+      }, userField, passField).catch(() => {});
       await userField.type(process.env.WP_USER || 'toffoarancia@googlemail.com', { delay: 30 });
-      await passField.click({ clickCount: 3 });
       await passField.type(process.env.WP_PASS || '60Toffo60!', { delay: 30 });
-      const submitBtn = await page.$('button[name="login"]') || await page.$('input[type="submit"]') || await page.$('button[type="submit"]');
-      if (submitBtn) {
-        await Promise.all([
-          submitBtn.click(),
-          page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {}),
-        ]);
-      }
+      await Promise.all([
+        page.evaluate(() => {
+          const btn = document.querySelector('button[name="login"]') || document.querySelector('input[type="submit"]') || document.querySelector('button[type="submit"]');
+          if (btn) btn.click();
+        }),
+        page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {}),
+      ]);
     }
     debug.loginUrl = page.url();
     debug.loggedIn = !debug.loginUrl.includes('a-minha-conta') || debug.loginUrl.includes('conta') && !debug.loginUrl.includes('action=login');
@@ -1084,8 +1030,44 @@ app.get('/debug-stream', async (req, res) => {
     debug.pageTitle = await page.title();
     debug.currentUrl = page.url();
 
-    // Run full stream extraction
-    debug.streams = await extractStreams(url);
+    // Extract streams directly from already-captured API responses
+    // (don't call extractStreams again — it would open a new login session)
+    const directStreams = [];
+    for (const resp of debug.apiResponses) {
+      if (!resp.url.includes('zetaplayer')) continue;
+      try {
+        const data = JSON.parse(resp.body);
+        debug._parsed = debug._parsed || [];
+        debug._parsed.push({ embed_url: data.embed_url });
+        if (data.embed_url) {
+          const m = data.embed_url.match(/(?:src|SRC)=["']([^"'<>\s]+)/i);
+          debug._parsed[debug._parsed.length-1].matched = m ? m[1] : 'NO MATCH';
+          if (m && m[1].startsWith('http')) {
+            const embedUrl = m[1];
+            // Try extractDirectVideo but don't block on failure
+            let direct = null;
+            try {
+              direct = await Promise.race([
+                extractDirectVideo(embedUrl),
+                new Promise(r => setTimeout(() => r(null), 15000))
+              ]);
+            } catch(e) { debug._parsed[debug._parsed.length-1].extractError = e.message; }
+
+            if (direct) {
+              directStreams.push({ title: '▶ PT (direto)', url: direct });
+            } else {
+              // Return embed URL directly — Stremio can open it
+              try {
+                const host = new URL(embedUrl).hostname.replace('www.', '');
+                directStreams.push({ title: '▶ Player (' + host + ')', externalUrl: embedUrl });
+              } catch {}
+            }
+          }
+        }
+      } catch(e) { console.log('[debug-stream] parse error: ' + e.message); }
+    }
+    directStreams.push({ title: '🌐 Abrir no browser', externalUrl: url });
+    debug.streams = directStreams;
   } catch(e) {
     debug.error = e.message;
   } finally {
