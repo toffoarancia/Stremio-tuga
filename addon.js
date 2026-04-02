@@ -513,6 +513,10 @@ async function puppeteerGet(url) {
   throw new Error('All proxies failed for ' + url);
 }
 
+// ─── Caches ───────────────────────────────────────────────────────────────────
+const seriesCache = new Map(); // slug -> { data, ts }
+const SERIES_CACHE_TTL = 60 * 60 * 1000; // 1 hour
+
 // ─── ID / URL helpers ────────────────────────────────────────────────────────
 
 function movieId(slug)   { return `tuga:movie:${slug}`; }
@@ -574,10 +578,73 @@ function scrapeItems($, typeFilter) {
   return items;
 }
 
-// ─── Scrape series detail ─────────────────────────────────────────────────────
-
 async function scrapeSeriesDetail(slug) {
-  // Use logged-in Puppeteer — bypasses Cloudflare IP block
+  // Fast path: plain fetch (works on Railway since site doesn't block it)
+  // Falls back to logged-in Puppeteer if blocked
+  let html = '';
+  try {
+    html = await get(seriesUrl(slug));
+    if (html.length < 5000) throw new Error('too short');
+  } catch(e) {
+    console.log('[series] plain fetch failed, trying Puppeteer login: ' + e.message);
+    html = await scrapeSeriesWithPuppeteer(slug);
+    const $ = cheerio.load(html || '');
+    return buildSeriesDetail(slug, $, html || '');
+  }
+
+  const $ = cheerio.load(html);
+  return buildSeriesDetail(slug, $, html);
+}
+
+function buildSeriesDetail(slug, $, html) {
+  const title = $('h3.Title,h2.Title,h1.Title,h1,h2,h3').not('nav *').first().text().trim() || slug;
+  const poster = ($('meta[property="og:image"]').attr('content') || '').trim();
+  const description = $('.Description p,.sinopse p').first().text().trim()
+    || $('p').filter((_, el) => $(el).text().length > 80).first().text().trim();
+
+  const seasons = {};
+  for (const m of html.matchAll(/data-snum=['"](\d+)['"][\s\S]*?\((\d+)\s*Episodes?\)/g)) {
+    const sn = parseInt(m[1]), cnt = parseInt(m[2]);
+    if (!seasons[sn]) seasons[sn] = Array.from({ length: cnt }, (_, i) => ({
+      number: i+1, title: 'Episódio '+(i+1), thumb: '', href: '', date: '',
+    }));
+  }
+  // Fallback plain text
+  if (Object.keys(seasons).length === 0) {
+    for (const m of html.matchAll(/Temporada\s+(\d+)\s*\((\d+)/gi)) {
+      const sn = parseInt(m[1]), cnt = parseInt(m[2]);
+      if (!seasons[sn]) seasons[sn] = Array.from({ length: cnt }, (_, i) => ({
+        number: i+1, title: 'Episódio '+(i+1), thumb: '', href: '', date: '',
+      }));
+    }
+  }
+  // Episode thumbs
+  $('li').each((_, li) => {
+    const $li = $(li);
+    const num = parseInt($li.contents().filter((_, n) => n.nodeType === 3).first().text().trim());
+    const thumb = $li.find('img').first().attr('src') || '';
+    if (num && thumb && seasons[1] && seasons[1][num-1]) seasons[1][num-1].thumb = thumb;
+  });
+  if (Object.keys(seasons).length === 0) {
+    seasons[1] = [{ number: 1, title: 'Episódio 1', thumb: '', href: '', date: '' }];
+  }
+
+  // Try to find episode slug from any episodio links in the HTML
+  const epLinkMatch = html.match(/href=["'][^"']*\/episodio\/([^"'\/]+)-temporada-/i);
+  const episodeSlug = epLinkMatch ? epLinkMatch[1] : null;
+  console.log('[series] ' + slug + ' episodeSlug=' + episodeSlug + ' seasons=' + Object.keys(seasons).join(','));
+
+  if (episodeSlug) {
+    for (const [s, eps] of Object.entries(seasons))
+      for (const ep of eps)
+        ep.href = BASE + '/episodio/' + episodeSlug + '-temporada-' + s + '-episodio-' + ep.number + '/';
+  }
+
+  return { title, poster, background: poster, description, seasons };
+}
+
+async function scrapeSeriesWithPuppeteer(slug) {
+  // Logged-in Puppeteer for when plain fetch is blocked
   const br = await getBrowser();
   const page = await br.newPage();
   try {
@@ -589,125 +656,22 @@ async function scrapeSeriesDetail(slug) {
       req.continue();
     });
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36');
-
-    // Login first — logged-in sessions bypass Cloudflare
     await page.goto('https://osteusfilmestuga.online/a-minha-conta/', { waitUntil: 'domcontentloaded', timeout: 20000 });
-    const userField = await page.$('#username') || await page.$('input[name="username"]') || await page.$('input[type="email"]');
-    const passField = await page.$('#password') || await page.$('input[name="password"]') || await page.$('input[type="password"]');
-    if (userField && passField) {
-      await userField.type(process.env.WP_USER || '', { delay: 20 });
-      await passField.type(process.env.WP_PASS || '', { delay: 20 });
+    const uf = await page.$('#username') || await page.$('input[name="username"]') || await page.$('input[type="email"]');
+    const pf = await page.$('#password') || await page.$('input[name="password"]') || await page.$('input[type="password"]');
+    if (uf && pf) {
+      await uf.type(process.env.WP_USER || '', { delay: 20 });
+      await pf.type(process.env.WP_PASS || '', { delay: 20 });
       const btn = await page.$('button[name="login"]') || await page.$('button[type="submit"]');
       if (btn) await Promise.all([btn.click(), page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => {})]);
     }
-
-    // Now fetch the series page
     await page.goto(seriesUrl(slug), { waitUntil: 'domcontentloaded', timeout: 30000 });
     await new Promise(r => setTimeout(r, 2000));
-
-    const data = await page.evaluate(() => {
-      const title = document.querySelector('h3.Title,h2.Title,h1.Title,h1,h2,h3')?.textContent?.trim() || '';
-      const poster = (document.querySelector('meta[property="og:image"]')?.content || '').trim();
-      const desc = Array.from(document.querySelectorAll('p')).find(p => p.textContent.length > 80)?.textContent?.trim() || '';
-
-      // Extract episodes directly from the page - they have data-pid (WP post ID)
-      // Structure: <a class="play-ep" data-pid="157987" data-epid="1" data-ssid="1" data-sec="876470b26e">
-      const episodes = {};
-      document.querySelectorAll('a.play-ep[data-pid]').forEach(a => {
-        const pid = a.getAttribute('data-pid');
-        const epid = parseInt(a.getAttribute('data-epid'));
-        const ssid = parseInt(a.getAttribute('data-ssid'));
-        const sec = a.getAttribute('data-sec') || '';
-        const thumb = a.querySelector('img')?.src || '';
-        const title = a.querySelector('.ep-title')?.textContent?.trim() || 'Episódio ' + epid;
-        if (pid && epid && ssid) {
-          if (!episodes[ssid]) episodes[ssid] = {};
-          episodes[ssid][epid] = { pid, sec, thumb, title };
-        }
-      });
-
-      // Season counts from the selector
-      const seasonCounts = {};
-      for (const m of document.body.innerHTML.matchAll(/data-snum=['"](\d+)['"][\s\S]*?\((\d+)\s*Episodes?\)/g)) {
-        if (!seasonCounts[parseInt(m[1])]) seasonCounts[parseInt(m[1])] = parseInt(m[2]);
-      }
-
-      return { title, poster, desc, episodes, seasonCounts };
-    });
-
-    console.log('[series] ' + slug + ' seasons found: ' + Object.keys(data.episodes).length + ' seasonCounts: ' + JSON.stringify(data.seasonCounts));
-
-    const seasons = {};
-
-    // Build seasons from extracted episode data-pids
-    for (const [s, eps] of Object.entries(data.episodes)) {
-      const sn = parseInt(s);
-      seasons[sn] = Object.entries(eps)
-        .sort(([a],[b]) => parseInt(a)-parseInt(b))
-        .map(([epNum, ep]) => ({
-          number: parseInt(epNum),
-          title: ep.title,
-          thumb: ep.thumb || '',
-          pid: ep.pid,
-          sec: ep.sec,
-        }));
-    }
-
-    // Fill in missing seasons from season counts (may need separate page loads)
-    for (const [s, cnt] of Object.entries(data.seasonCounts)) {
-      const sn = parseInt(s);
-      if (!seasons[sn]) {
-        seasons[sn] = Array.from({ length: cnt }, (_, i) => ({
-          number: i+1, title: 'Episódio '+(i+1), thumb: '', pid: '', sec: '',
-        }));
-      }
-    }
-
-    if (Object.keys(seasons).length === 0) {
-      seasons[1] = [{ number: 1, title: 'Episódio 1', thumb: '', pid: '', sec: '' }];
-    }
-
-    return { title: data.title || slug, poster: data.poster, background: data.poster, description: data.desc, seasons };
-  } catch(e) {
-    console.error('[series] error: ' + e.message);
-    return { title: slug, poster: '', background: '', description: '', seasons: { 1: [{ number: 1, title: 'Episódio 1', thumb: '', href: '' }] } };
+    return await page.content();
   } finally {
     await page.close().catch(() => {});
   }
 }
-
-async function discoverEpisodeSlugLoggedIn(seriesSlug, existingPage) {
-  // Use an already-logged-in page to test episode URL guesses
-  const guesses = [
-    seriesSlug,
-    seriesSlug.replace(/^(a|o|os|as|um|uma)-/, ''),
-  ];
-  const br = await getBrowser();
-  const page = await br.newPage();
-  try {
-    await page.setRequestInterception(true);
-    page.on('request', req => {
-      if (['image','font','media','stylesheet','script'].includes(req.resourceType())) return req.abort();
-      req.continue();
-    });
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36');
-    for (const guess of guesses) {
-      try {
-        await page.goto(BASE + '/episodio/' + guess + '-temporada-1-episodio-1/', { waitUntil: 'domcontentloaded', timeout: 12000 });
-        const title = await page.title();
-        if (!title.toLowerCase().includes('not found') && !title.includes('404')) {
-          console.log('[discoverSlug] found: ' + guess + ' title=' + title);
-          return guess;
-        }
-      } catch(e) { console.log('[discoverSlug] ' + guess + ': ' + e.message); }
-    }
-  } finally {
-    await page.close().catch(() => {});
-  }
-  return null;
-}
-
-
 
 
 
@@ -832,7 +796,10 @@ builder.defineMetaHandler(async ({ type, id }) => {
       }
       const $ = cheerio.load(html);
       const title = $('h3.Title, h2.Title, h1.Title, h1, h2, h3').not('nav *').first().text().trim() || slug;
-      const poster = ($('meta[property="og:image"]').attr('content') || '').trim();
+      // Try multiple poster sources
+      const poster = ($('meta[property="og:image"]').attr('content') || '').trim()
+        || $('img[src*="tmdb.org"]').first().attr('src') || ''
+        || $('img[src*="image.tmdb"]').first().attr('src') || '';
       const description = $('.Description p, .sinopse p').first().text().trim()
         || $('p').filter((_, el) => $(el).text().length > 80).first().text().trim();
       const year = $('a[href*="/lancamento/"]').first().text().trim();
@@ -842,11 +809,26 @@ builder.defineMetaHandler(async ({ type, id }) => {
     }
 
     if (type === 'series') {
-      const detail = await scrapeSeriesDetail(slug);
+      // Check cache first
+      let detail;
+      const cached = seriesCache.get(slug);
+      if (cached && Date.now() - cached.ts < SERIES_CACHE_TTL) {
+        console.log('[meta] cache hit: ' + slug);
+        detail = cached.data;
+      } else {
+        // Add timeout so Stremio doesn't hang forever
+        detail = await Promise.race([
+          scrapeSeriesDetail(slug),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 55000)),
+        ]).catch(e => {
+          console.error('[meta] series detail error/timeout: ' + e.message);
+          return cached?.data || { title: slug, poster: '', background: '', description: '', seasons: {} };
+        });
+        seriesCache.set(slug, { data: detail, ts: Date.now() });
+      }
       const videos = [];
       Object.entries(detail.seasons).forEach(([s, eps]) => {
         eps.forEach(ep => {
-          // Format: tuga:series:slug:season:episode[:pid:sec]
           const pidSuffix = ep.pid ? ':' + ep.pid + ':' + (ep.sec || '') : '';
           videos.push({
             id: `${id}:${s}:${ep.number}${pidSuffix}`,
@@ -855,7 +837,7 @@ builder.defineMetaHandler(async ({ type, id }) => {
           });
         });
       });
-      return { meta: { id, type: 'series', name: detail.title, poster: detail.poster, background: detail.background, description: detail.description, videos, website: seriesUrl(slug) } };
+      return { meta: { id, type: 'series', name: detail.title || slug, poster: detail.poster, background: detail.background, description: detail.description, videos, website: seriesUrl(slug) } };
     }
 
     return { meta: null };
@@ -1294,3 +1276,4 @@ app.listen(PORT, () => {
   // Pre-warm browser
   getBrowser().then(() => console.log('   Browser : ready ✅')).catch(e => console.error('   Browser : failed ❌', e.message));
 });
+
