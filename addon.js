@@ -773,7 +773,11 @@ builder.defineCatalogHandler(async ({ type, id, extra }) => {
     console.log(`[catalog] fetching ${fetchUrl}`);
     let html = '';
     let fetchErr = null;
-    try { html = await puppeteerGet(fetchUrl); } catch(e) { fetchErr = e.message; }
+    // Try plain fetch first (works on Railway), fall back to proxy
+    try { html = await get(fetchUrl); } catch(e) {
+      fetchErr = e.message;
+      try { html = await puppeteerGet(fetchUrl); } catch(e2) { fetchErr = e2.message; }
+    }
 
     if (!html) {
       console.error(`[catalog] empty response for ${fetchUrl} — error: ${fetchErr}`);
@@ -822,7 +826,10 @@ builder.defineMetaHandler(async ({ type, id }) => {
     const slug = m[2];
 
     if (type === 'movie') {
-      const html = await puppeteerGet(movieUrl(slug));
+      let html = '';
+      try { html = await get(movieUrl(slug)); } catch(e) {
+        try { html = await puppeteerGet(movieUrl(slug)); } catch(e2) {}
+      }
       const $ = cheerio.load(html);
       const title = $('h3.Title, h2.Title, h1.Title, h1, h2, h3').not('nav *').first().text().trim() || slug;
       const poster = ($('meta[property="og:image"]').attr('content') || '').trim();
