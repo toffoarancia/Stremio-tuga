@@ -612,7 +612,7 @@ async function scrapeSeriesWithPuppeteer(slug) {
 
 const manifest = {
   id: 'community.osteusfilmestuga.v4',
-  version: '4.0.0',
+  version: '4.1.0',
   name: '🇵🇹 Os Teus Filmes Tuga',
   description: 'Filmes e séries dobrados em Português de Portugal. Streams diretos sem anúncios.',
   logo: LOGO,
