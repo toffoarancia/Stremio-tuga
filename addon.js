@@ -1504,28 +1504,74 @@ app.get('/debug-child-m3u8', async (req, res) => {
   }
 });
 
-// Debug: show raw m3u8 content as plain text
 app.get('/debug-m3u8', async (req, res) => {
   const embedUrl = req.query.embed || 'https://minochinos.com/embed/4u1yo63ktzoj';
   try {
-    const result = await extractDirectVideo(embedUrl);
-    if (!result) return res.json({ error: 'No stream found' });
-    const referer = result.referer || embedUrl;
-    const resp = await fetch(result.url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0',
-        'Referer': referer,
-        'Origin': new URL(referer).origin,
+    const br = await getBrowser();
+    const page = await br.newPage();
+    try {
+      await page.setRequestInterception(true);
+      let m3u8Url = null, referer = embedUrl;
+      page.on('request', req => {
+        const u = req.url();
+        if (['image','font','media'].includes(req.resourceType())) return req.abort();
+        const adHosts = ['tiktokcdn','tiktok.com','googlesyndication','doubleclick','imasdk','googleads','yandex','mc.yandex'];
+        if (adHosts.some(h => u.includes(h))) return req.abort();
+        if (u.includes('minochinos.com/ad') || u.includes('assets/jquery/static.js')) return req.abort();
+        if (u.includes('master.m3u8') && u.includes('minochinos.com')) {
+          m3u8Url = u;
+          referer = req.headers()['referer'] || embedUrl;
+        }
+        req.continue();
+      });
+      await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36');
+      await page.goto(embedUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+      await new Promise(r => setTimeout(r, 3000));
+
+      // Extract JWPlayer config from raw HTML
+      const pageHtml = await page.content().catch(() => '');
+      const jwSetupMatch = pageHtml.match(/jwplayer[^)]*\.setup\s*\(\s*(\{[\s\S]{0,5000}?\})\s*\)/);
+      const jwConfig = jwSetupMatch ? jwSetupMatch[1] : null;
+      // Also look for any stream URLs in the HTML
+      const streamUrls = [...pageHtml.matchAll(/https?:\/\/[^"'\s<>]+\.m3u8[^"'\s<>]*/g)].map(m => m[0]);
+
+      // Try JWPlayer API
+      const jwApiData = await page.evaluate(() => {
+        try {
+          if (typeof jwplayer === 'undefined') return { error: 'jwplayer not defined' };
+          const p = jwplayer();
+          return {
+            playlist: p.getPlaylist ? JSON.stringify(p.getPlaylist()) : null,
+            config: p.getConfig ? JSON.stringify(p.getConfig()).slice(0, 3000) : null,
+            state: p.getState ? p.getState() : null,
+          };
+        } catch(e) { return { error: e.message }; }
+      }).catch(e => ({ error: e.message }));
+
+      // Fetch master m3u8
+      let content = '', status = 0;
+      if (m3u8Url) {
+        const resp = await page.evaluate(async (url, ref) => {
+          const r = await fetch(url, { headers: { 'Referer': ref } });
+          return { status: r.status, text: await r.text() };
+        }, m3u8Url, referer);
+        content = resp.text;
+        status = resp.status;
       }
-    });
-    const text = await resp.text();
-    res.json({
-      m3u8Url: result.url,
-      referer,
-      status: resp.status,
-      content: text,
-      firstSegment: text.split('\n').find(l => l.trim() && !l.startsWith('#')),
-    });
+
+      res.json({
+        m3u8Url,
+        referer,
+        status,
+        content,
+        firstSegment: content.split('\n').find(l => l.trim() && !l.startsWith('#')),
+        jwConfig: jwConfig?.slice(0, 2000),
+        streamUrlsInHtml: streamUrls,
+        jwApiData,
+      });
+    } finally {
+      await page.close().catch(() => {});
+    }
   } catch(e) {
     res.json({ error: e.message });
   }
